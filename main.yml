@@ -1,0 +1,259 @@
+---
+- name: "Create EC2 instance with a keypair and Security Group"
+  hosts: localhost
+  vars_prompt:
+    - name: "region"
+      prompt: "Enter the region in which you want to create server"
+      private: no
+      default: "ap-south-1"
+
+    - name: "type"
+      prompt: "Enter the instance type of servers"
+      private: no
+      default: "t2.micro"
+
+    - name: "ami_id"
+      prompt: "Enter the AMI ID of instances"
+      private: no
+      default: "ami-041d6256ed0f2061c"
+
+    - name: "project_name"
+      prompt: "Enter the Project name"
+      private: no
+
+    - name: "key_name"
+      prompt: "Enter the name of SSH keypair to access the servers"
+      private: no
+  tasks:
+##################################SSH KEY CREATION######################################
+    - name: "SSH keypair creation. Keyname is {{key_name}}"
+      ec2_key:
+        region: "{{region}}"
+        name: "{{key_name}}"
+        state: present
+      register: "key_info"
+##################################COPY PRIVATE KEY#####################################
+    - name: "copy private key to local server"
+      when: key_info.changed == true
+      copy:
+        content: "{{key_info.key.private_key}}"
+        dest: "./{{key_name}}.pem"
+        mode: "0400"
+##################################SECURITY GROUP CREATION#################################
+    - name: "Create Security group"
+      ec2_group:
+        region: "{{region}}"
+        name: "{{project_name}}-sg"
+        description: "secuirty group for devops instance"
+        tags:
+          Name: "{{project_name}}-sg"          
+        rules:
+          - proto: tcp
+            ports:
+              - 80
+              - 443
+              - 22
+              - 3306
+            cidr_ip: 0.0.0.0/0
+            cidr_ipv6: ::/0
+            rule_desc: "allow all on ports 80, 443, 3306 and 22"
+        rules_egress:
+          - proto: -1
+            ports: -1
+            cidr_ip: 0.0.0.0/0
+            cidr_ipv6: ::/0
+      register: "sg_info"
+
+##################################CREATE EC2###########################################
+    - name: "Create EC2"
+      ec2:
+        region: "{{region}}"
+        key_name: "{{key_info.key.name}}"
+        instance_type: "{{type}}"
+        image: "{{ami_id}}"
+        wait: yes
+        group_id: "{{sg_info.group_id}}"
+        instance_tags:
+          Name: "{{project_name}}-webserver"
+        count_tag:
+          Name: "{{project_name}}-webserver"
+        exact_count: 1
+      register: ec2_info
+##################################CREATE DYNAMIC INVENTORY###########################################
+    - name: "Create Dynamic inventory"
+      add_host:
+        groups: "webserver"
+        hostname: "{{ ec2_info.tagged_instances[0].public_ip }}"
+        ansible_host: "{{ ec2_info.tagged_instances[0].public_ip }}"
+        ansible_user: "ec2-user"
+        ansible_port: 22
+        ansible_private_key_file: "{{key_name}}.pem"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"        
+################################################################################################################### 
+#PLAYBOOK FOR WORDPRESS SITE
+###################################################################################################################    
+- name: "setting up LAMP"
+  hosts: webserver
+  become: yes
+  vars:
+    http_port: 80
+    http_user: apache
+    http_group: apache
+    download_link: "https://wordpress.org/latest.tar.gz"
+  vars_prompt:
+    - name: "http_domain"
+      prompt: "Enter the domain name of the website"
+      private: no
+
+    - name: "db_root_password"
+      prompt: "Enter new root password for database"
+      confirm: yes
+
+    - name: "wp_db"
+      prompt: "Enter name of database for Wordpress"
+      private: no
+
+    - name: "wp_db_user"
+      prompt: "Enter name of database user for Wordpress"
+      private: no
+
+    - name: "wp_db_user_password"
+      prompt: "Enter the password for wordpress database user"
+      confirm: yes
+
+  tasks:
+   
+    - name: "Install apache"
+      yum:
+        name: 
+          - httpd
+        state: present
+
+    - name: "Install PHP 7.4"
+      shell: amazon-linux-extras install php7.4 -y
+
+    - name: "copy virtualhost from template"
+      template:
+        src: vhost.conf.tmpl
+        dest: /etc/httpd/conf.d/{{http_domain}}.conf
+
+    - name: "create document root for website"
+      file:
+        path: /var/www/html/{{http_domain}}/
+        state: directory
+        owner: "{{http_user}}"
+        group:  "{{http_group}}"
+
+    - name: "create phpinfo page"
+      copy:
+        content: "<?php phpinfo(); ?>"
+        dest: /var/www/html/{{http_domain}}/phpinfo.php
+        owner: "{{http_user}}"
+        group: "{{http_group}}"
+
+    - name: "restart and enable apache service"
+      service:
+        name: httpd
+        state: restarted
+
+    - name: "Install mariadb"
+      yum:
+        name: 
+          - mariadb-server
+          - MySQL-python
+        state: present
+
+    - name: "Restart and enable mariadb-server"
+      service: 
+        name: mariadb
+        state: restarted
+        enabled: true
+
+    - name: "setting root password for mariadb"
+      ignore_errors: true
+      mysql_user:
+        login_user: "root"
+        login_password: ""
+        user: "root"
+        password: "{{db_root_password}}"
+        host_all: yes
+
+    - name: "remove anonymous users"
+      mysql_user:
+        login_user: "root"
+        login_password: "{{db_root_password}}"
+        user: ""
+        state: absent
+
+    - name: "remove test database"
+      mysql_db:
+        login_user: "root"
+        login_password: "{{db_root_password}}"
+        name: "test"
+        state: absent
+
+    - name: "create wordpress database"
+      mysql_db:
+        login_user: "root"
+        login_password: "{{db_root_password}}"
+        name: "{{wp_db}}"
+        state: present
+
+    - name: "create wordpress db user"
+      mysql_user:
+        login_user: "root"
+        login_password: "{{db_root_password}}"
+        name: "{{wp_db_user}}"
+        state: present
+        password: "{{wp_db_user_password}}"
+        priv: '{{wp_db}}.*:ALL'
+
+##########################DOWNLOAD AND SETUP WORDPRESS#################################################   
+    - name: "Download wordpress from Internet"
+      get_url:
+        url: "{{download_link}}"
+        dest: "/tmp/wordpress.tar.gz"
+        remote_src: true
+
+    - name: "extract tar file"
+      unarchive:
+        src: "/tmp/wordpress.tar.gz"
+        dest: "/tmp/"
+        remote_src: true
+
+    - name: "copy wordpress files from /tmp to docroot"
+      copy: 
+        src: "/tmp/wordpress/"
+        dest: /var/www/html/{{http_domain}}/
+        owner: "{{http_user}}"
+        group: "{{http_group}}"
+        remote_src: true
+
+    - name: "configuring wp-config.php from template"
+      template:
+        src: wp-config.php.tmpl
+        dest: /var/www/html/{{http_domain}}/wp-config.php
+        owner: "{{http_user}}"
+        group: "{{http_group}}"
+
+    - name: "clean-up unwanted files"
+      file:
+        path: "{{item}}"
+        state: absent
+      with_items:
+        - "/tmp/wordpress"
+        - "/tmp/wordpress.tar.gz"
+
+    - name: "Final restart of apache"
+      service:
+        name: httpd
+        state: restarted
+
+    - name: "Print website details"
+      debug:
+        msg: 
+        - "Your Wordpress website is ready. Please add below A RECORD in your DNS'"
+        - "NAME=====> {{http_domain}}"
+        - "TYPE=====> A"
+        - "VALUE====>{{ ansible_ssh_host }}"
+
